@@ -16,7 +16,7 @@ import numpy as np
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "1.3.0"
+    VERSION = "1.5.0"
     BUILD_DATE = "2025-05-20"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
@@ -362,22 +362,66 @@ class QRCodeDecoder(QMainWindow):
         try:
             # 处理剪贴板图片
             if self.current_image_path == "clipboard":
-                # 直接从显示的图片获取
+                # 检查剪贴板图片是否有效
+                if not hasattr(self, 'image_label') or not self.image_label.pixmap():
+                    raise ValueError("剪贴板中没有有效的图片")
+                
                 pixmap = self.image_label.pixmap()
-                if pixmap:
-                    # 转换为QImage再转换为OpenCV格式
-                    qimage = pixmap.toImage()
-                    qimage = qimage.convertToFormat(QImage.Format_RGB888)
-                    width = qimage.width()
-                    height = qimage.height()
+                if pixmap.isNull():
+                    raise ValueError("剪贴板图片无效")
+                
+                # 转换为QImage
+                qimage = pixmap.toImage()
+                if qimage.isNull():
+                    raise ValueError("图片转换失败")
+                
+                # 转换为RGB888格式
+                qimage = qimage.convertToFormat(QImage.Format_RGB888)
+                if qimage.isNull():
+                    raise ValueError("图片格式转换失败")
+                
+                # 获取图片尺寸和数据
+                width = qimage.width()
+                height = qimage.height()
+                bytes_per_line = qimage.bytesPerLine()
+                
+                if width <= 0 or height <= 0:
+                    raise ValueError("无效的图片尺寸")
+                
+                # 获取图片数据
+                buffer = qimage.constBits()
+                if buffer is None:
+                    raise ValueError("无法获取图片数据")
+                
+                buffer.setsize(qimage.byteCount())
+                
+                # 转换为numpy数组
+                try:
+                    arr = np.frombuffer(buffer, np.uint8)
                     
-                    ptr = qimage.bits()
-                    ptr.setsize(qimage.byteCount())
-                    arr = np.array(ptr).reshape(height, width, 3)  # 高度、宽度、通道
-                    img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                    # 处理不同情况的行填充
+                    if bytes_per_line == width * 3:  # 无填充
+                        img = arr.reshape((height, width, 3))
+                    else:  # 有行填充
+                        # 计算实际每行像素数据大小
+                        img = arr.reshape((height, bytes_per_line))
+                        img = img[:, :width*3]  # 去除填充部分
+                        img = img.reshape((height, width, 3))
+                    
+                    # 转换颜色空间
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    
+                except Exception as e:
+                    raise ValueError(f"图片数据转换失败: {str(e)}")
             else:
                 # 使用OpenCV读取图片文件
                 img = cv2.imread(self.current_image_path)
+                if img is None:
+                    raise ValueError(f"无法加载图片文件: {self.current_image_path}")
+            
+            # 检查图片是否有效
+            if img is None or img.size == 0:
+                raise ValueError("无效的图片数据")
             
             # 解码二维码和条形码
             decoded_objects = decode(img)
@@ -404,6 +448,7 @@ class QRCodeDecoder(QMainWindow):
             
             # 拼接所有解码结果，包含类型信息
             results = []
+            print(f"[DEBUG] 解码结果数量: {len(decoded_objects)}")
             for obj in decoded_objects:
                 code_type = type_mapping.get(obj.type, obj.type)
                 try:
@@ -415,7 +460,8 @@ class QRCodeDecoder(QMainWindow):
             result = "\n\n".join(results)
             self.result_text.setPlainText(result)
             self.copy_button.setEnabled(True)
-            
+            print(f"[DEBUG] 解码结果: {result}")
+
             # 保存到历史记录（如果是文件则保存路径，剪贴板图片则不保存路径）
             image_path = self.current_image_path if self.current_image_path != "clipboard" else ""
             self.save_to_history(result, image_path)
@@ -424,8 +470,10 @@ class QRCodeDecoder(QMainWindow):
             self.status_bar.showMessage("解码成功", 3000)
             
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"解码失败: {str(e)}")
-            self.status_bar.showMessage(f"解码失败: {str(e)}", 3000)
+            error_msg = f"解码失败: {str(e)}"
+            print(f"[DEBUG] {error_msg}")
+            QMessageBox.critical(self, "错误", error_msg)
+            self.status_bar.showMessage(error_msg, 3000)
 
     
     def copy_result(self):
