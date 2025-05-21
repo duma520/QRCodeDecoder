@@ -1,5 +1,9 @@
 # 二维码/条形码解码工具 - 全方位使用说明书
 
+![image](https://github.com/user-attachments/assets/53d9cb5a-a227-45bb-b07c-84f76ff41d08)
+
+
+
 ## 项目概览
 
 **项目名称**: 二维码/条形码解码工具  
