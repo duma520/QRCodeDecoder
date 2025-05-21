@@ -16,7 +16,7 @@ import numpy as np
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "1.5.0"
+    VERSION = "1.11.0"
     BUILD_DATE = "2025-05-20"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
@@ -69,6 +69,26 @@ class MacaronColors:
     # 中性色
     CARAMEL_CREAM = QColor(240, 230, 221) # 焦糖奶霜
 
+    # 添加颜色循环列表
+    COLOR_CYCLE = [
+        SAKURA_PINK, SKY_BLUE, MINT_GREEN, 
+        LEMON_YELLOW, LAVENDER, PEACH_ORANGE,
+        APPLE_GREEN, LILAC_MIST, BUTTER_CREAM,
+        TARO_PURPLE, CARAMEL_CREAM
+    ]
+
+    @classmethod
+    def get_random_color(cls):
+        """获取随机马卡龙色"""
+        colors = [
+            cls.SAKURA_PINK, cls.SKY_BLUE, cls.MINT_GREEN,
+            cls.LEMON_YELLOW, cls.LAVENDER, cls.PEACH_ORANGE,
+            cls.APPLE_GREEN, cls.LILAC_MIST, cls.BUTTER_CREAM,
+            cls.TARO_PURPLE, cls.CARAMEL_CREAM
+        ]
+        return colors[np.random.randint(0, len(colors))]
+
+
 class QRCodeDecoder(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -86,6 +106,7 @@ class QRCodeDecoder(QMainWindow):
         
         # 创建主界面
         self.create_main_ui()
+        self.update_background_colors()
         
         # 高DPI支持
         self.setAttribute(Qt.WA_AlwaysStackOnTop)
@@ -270,6 +291,7 @@ class QRCodeDecoder(QMainWindow):
         right_layout.addWidget(history_label)
         
         self.history_list = QListWidget()
+        self.history_list.setSelectionMode(QListWidget.ExtendedSelection)  # 添加这行以支持多选
         self.history_list.itemDoubleClicked.connect(self.load_history_item)
         right_layout.addWidget(self.history_list)
 
@@ -313,6 +335,20 @@ class QRCodeDecoder(QMainWindow):
         self.favorite_button.clicked.connect(self.toggle_favorite)
         history_button_layout.addWidget(self.favorite_button)
 
+        self.select_all_button = QPushButton("全选")
+        self.select_all_button.setIcon(QIcon.fromTheme("edit-select-all"))
+        self.select_all_button.clicked.connect(self.select_all_history_items)
+        history_button_layout.addWidget(self.select_all_button)
+
+        self.clear_all_history_button = QPushButton("清空历史")
+        self.clear_all_history_button.setIcon(QIcon.fromTheme("edit-clear"))
+        self.clear_all_history_button.clicked.connect(self.clear_all_history)
+        history_button_layout.addWidget(self.clear_all_history_button)
+
+        # 设置按钮对象名称用于样式
+        self.select_all_button.setObjectName("select_all_button")
+        self.clear_all_history_button.setObjectName("clear_all_history_button")
+
         right_layout.addLayout(history_button_layout)
 
         
@@ -351,6 +387,7 @@ class QRCodeDecoder(QMainWindow):
             
             self.image_label.setPixmap(scaled_pixmap)
             self.decode_button.setEnabled(True)
+            self.update_background_colors()  # 添加这行
             self.status_bar.showMessage(f"已加载图片: {file_path}", 3000)
     
     def decode_qrcode(self):
@@ -430,6 +467,9 @@ class QRCodeDecoder(QMainWindow):
                 QMessageBox.information(self, "提示", "未检测到二维码或条形码")
                 return
             
+            # 创建带标记的图片副本用于显示
+            marked_img = img.copy()
+
             # 支持的类型映射表
             type_mapping = {
                 'AZTEC': 'Aztec码',
@@ -449,13 +489,41 @@ class QRCodeDecoder(QMainWindow):
             # 拼接所有解码结果，包含类型信息
             results = []
             print(f"[DEBUG] 解码结果数量: {len(decoded_objects)}")
-            for obj in decoded_objects:
+            for i, obj in enumerate(decoded_objects):
                 code_type = type_mapping.get(obj.type, obj.type)
                 try:
                     content = obj.data.decode('utf-8')
                 except UnicodeDecodeError:
                     content = str(obj.data)
-                results.append(f"[{code_type}]\n{content}")
+            
+                # 添加序号和更明显的分隔
+                results.append(f"=== 识别结果 {i+1} ===\n类型: {code_type}\n内容:\n{content}")
+                
+                # 在图片上标记二维码位置
+                points = obj.polygon
+                if len(points) > 4: 
+                    hull = cv2.convexHull(np.array([point for point in points], dtype=np.float32))
+                    cv2.polylines(marked_img, [hull], True, (0, 255, 0), 2)
+                else:
+                    # 绘制边界框
+                    x, y, w, h = obj.rect
+                    cv2.rectangle(marked_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                
+                # 在图片上添加序号标签
+                cv2.putText(marked_img, str(i+1), (obj.rect[0], obj.rect[1]-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            # 显示带标记的图片
+            if self.current_image_path != "clipboard":  # 不修改剪贴板图片的显示
+                marked_img_rgb = cv2.cvtColor(marked_img, cv2.COLOR_BGR2RGB)
+                height, width, channel = marked_img_rgb.shape
+                bytes_per_line = 3 * width
+                q_image = QImage(marked_img_rgb.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                self.image_label.setPixmap(QPixmap.fromImage(q_image).scaled(
+                    self.image_label.size() - QSize(20, 20), 
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                ))
             
             result = "\n\n".join(results)
             self.result_text.setPlainText(result)
@@ -466,6 +534,9 @@ class QRCodeDecoder(QMainWindow):
             image_path = self.current_image_path if self.current_image_path != "clipboard" else ""
             self.save_to_history(result, image_path)
             self.load_history()
+            
+            # 解码成功后更新背景色
+            self.update_background_colors()
             
             self.status_bar.showMessage("解码成功", 3000)
             
@@ -490,6 +561,7 @@ class QRCodeDecoder(QMainWindow):
         self.result_text.clear()
         self.decode_button.setEnabled(False)
         self.copy_button.setEnabled(False)
+        self.update_background_colors()  # 添加这行
         
         if hasattr(self, 'current_image_path'):
             del self.current_image_path
@@ -520,21 +592,32 @@ class QRCodeDecoder(QMainWindow):
         """)
         records = self.cursor.fetchall()
         
-        for record in records:
+        for index, record in enumerate(records):
             id, timestamp, content, image_path, code_type, is_favorite = record
             item_text = f"{timestamp}: {content[:100]}{'...' if len(content) > 100 else ''}"
             item = QListWidgetItem(item_text)
             
-            # 设置收藏项的背景色
+            # 设置交替颜色，收藏项优先使用黄色
             if is_favorite:
                 item.setBackground(MacaronColors.LEMON_YELLOW)
+            else:
+                # 使用模运算循环颜色列表
+                color_index = index % len(MacaronColors.COLOR_CYCLE)
+                item.setBackground(MacaronColors.COLOR_CYCLE[color_index])
+            
+            # 设置文字颜色与背景形成对比
+            item.setForeground(QColor(60, 60, 60))  # 深灰色文字
             
             self.history_list.addItem(item)
             item.setData(Qt.UserRole, record)
 
+
     
     def load_history_item(self, item):
         """加载历史记录项"""
+        # 保持其他项的选中状态
+        self.history_list.setCurrentItem(item)  # 只设置当前项为当前项，不影响其他选中项
+
         record = item.data(Qt.UserRole)
         # 新结构包含6个字段
         if len(record) == 6:
@@ -545,6 +628,7 @@ class QRCodeDecoder(QMainWindow):
         # 显示解码内容
         self.result_text.setPlainText(content)
         self.copy_button.setEnabled(True)
+        self.update_background_colors()  # 添加这行
         
         # 显示图片
         if image_path:
@@ -588,6 +672,7 @@ class QRCodeDecoder(QMainWindow):
                 
                 self.image_label.setPixmap(scaled_pixmap)
                 self.decode_button.setEnabled(True)
+                self.update_background_colors()  # 添加这行
                 
                 # 标记为剪贴板来源
                 self.current_image_path = "clipboard"
@@ -669,7 +754,7 @@ class QRCodeDecoder(QMainWindow):
             return False
 
     def delete_history_item(self):
-        """删除选中的历史记录项"""
+        """删除选中的历史记录项（支持多选）"""
         selected_items = self.history_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "警告", "请先选择要删除的历史记录")
@@ -677,7 +762,7 @@ class QRCodeDecoder(QMainWindow):
         
         reply = QMessageBox.question(
             self, "确认删除",
-            "确定要删除选中的历史记录吗？此操作不可撤销！",
+            f"确定要删除选中的 {len(selected_items)} 条历史记录吗？此操作不可撤销！",
             QMessageBox.Yes | QMessageBox.No
         )
         
@@ -688,7 +773,7 @@ class QRCodeDecoder(QMainWindow):
                 self.history_list.takeItem(self.history_list.row(item))
             
             self.conn.commit()
-            self.status_bar.showMessage("已删除选中的历史记录", 3000)
+            self.status_bar.showMessage(f"已删除 {len(selected_items)} 条历史记录", 3000)
             
     def toggle_favorite(self):
         """切换历史记录的收藏状态"""
@@ -714,6 +799,55 @@ class QRCodeDecoder(QMainWindow):
         
         self.conn.commit()
         self.status_bar.showMessage("已更新收藏状态", 3000)
+
+    def select_all_history_items(self):
+        """全选历史记录项"""
+        for i in range(self.history_list.count()):
+            item = self.history_list.item(i)
+            item.setSelected(True)
+        self.history_list.selectAll()  # 使用内置的selectAll方法更可靠
+        self.status_bar.showMessage("已全选所有历史记录", 5000)
+
+    def clear_all_history(self):
+        """清空所有历史记录"""
+        reply = QMessageBox.question(
+            self, "确认清空",
+            "确定要清空所有历史记录吗？此操作不可撤销！",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.cursor.execute("DELETE FROM history")
+            self.conn.commit()
+            self.history_list.clear()
+            self.status_bar.showMessage("已清空所有历史记录", 5000)
+
+    def update_background_colors(self):
+        """更新左右两侧背景色（确保两侧颜色不同）"""
+        # 左侧图片区域背景色
+        left_color = MacaronColors.get_random_color()
+        
+        # 右侧结果区域背景色（确保与左侧不同）
+        right_color = MacaronColors.get_random_color()
+        while right_color == left_color:  # 如果颜色相同则重新选择
+            right_color = MacaronColors.get_random_color()
+        
+        self.image_label.setStyleSheet(f"""
+            background-color: {left_color.name()};
+            border: 1px solid #c0c0c0;
+        """)
+        
+        self.result_text.setStyleSheet(f"""
+            background-color: {right_color.name()};
+            border: px solid #c0c0c0;
+        """)
+        
+        # 可选：在状态栏显示当前颜色信息（调试用）
+        self.status_bar.showMessage(
+            f"背景色更新: 左侧 {left_color.name()}, 右侧 {right_color.name()}", 
+            2000
+        )
+
 
     def closeEvent(self, event):
         """关闭窗口事件"""
