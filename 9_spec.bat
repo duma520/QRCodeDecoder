@@ -1,0 +1,1 @@
+pyinstaller QRCodeDecoder.spec

@@ -1,5 +1,6 @@
 import sys
 import sqlite3
+import io
 import os
 import csv
 import json
@@ -8,23 +9,24 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                             QWidget, QLabel, QPushButton, QTextEdit, QFileDialog, 
                             QMessageBox, QListWidget, QSplitter, QStatusBar,QListWidgetItem)
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QPalette, QImage
-from PyQt5.QtCore import Qt, QSize,QTimer
+from PyQt5.QtCore import Qt, QSize, QTimer, QSettings
 import cv2
 from pyzbar.pyzbar import decode
 import numpy as np
+from PIL import Image
 
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "1.11.0"
-    BUILD_DATE = "2025-05-20"
+    VERSION = "1.16.0"
+    BUILD_DATE = "2026-08-20"
     AUTHOR = "杜玛"
     LICENSE = "MIT"
     COPYRIGHT = "© 永久 杜玛"
     URL = "https://github.com/duma520"
     MAINTAINER_EMAIL = "不提供"
     NAME = "二维码/条形码解码工具"
-    DESCRIPTION = "二维码/条形码解码工具，支持多种格式的二维码和条形码解码，提供历史记录功能。"
+    DESCRIPTION = "支持多种格式的条码和二维码解码工具，包括QR码、Data Matrix、PDF417、Aztec码、EAN/UPC、Code 128/39/93等30多种条码格式，提供历史记录功能。"
 
 
     @classmethod
@@ -107,6 +109,22 @@ class QRCodeDecoder(QMainWindow):
         # 创建主界面
         self.create_main_ui()
         self.update_background_colors()
+        
+        # 设置实时自动保存（v1.16.0）：500ms 防抖定时器，变更后静默写注册表
+        self._loading = True  # 加载设置期间禁止触发自动保存
+        self._last_dir = ""
+        self._start_maximized = False
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(500)
+        self._settings_save_timer.timeout.connect(self._save_settings_now)
+        
+        # 分割器移动时触发自动保存
+        self.splitter.splitterMoved.connect(lambda *_: self._autosave_settings())
+        
+        # 加载设置（窗口几何/最大化/分割器/最后目录）
+        self.load_settings()
+        self._loading = False
         
         # 高DPI支持
         self.setAttribute(Qt.WA_AlwaysStackOnTop)
@@ -221,7 +239,7 @@ class QRCodeDecoder(QMainWindow):
         main_layout.setSpacing(10)
         
         # 分割器
-        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = QSplitter(Qt.Horizontal)
         
         # 左侧区域 - 图片和操作
         left_widget = QWidget()
@@ -353,12 +371,12 @@ class QRCodeDecoder(QMainWindow):
 
         
         # 添加部件到分割器
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        self.splitter.addWidget(left_widget)
+        self.splitter.addWidget(right_widget)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
         
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(self.splitter)
         
         # 状态栏
         self.status_bar = QStatusBar()
@@ -370,12 +388,14 @@ class QRCodeDecoder(QMainWindow):
     def load_image(self):
         """加载图片"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "", 
+            self, "选择图片", self._last_dir, 
             "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif)"
         )
         
         if file_path:
             self.current_image_path = file_path
+            self._last_dir = os.path.dirname(file_path)
+            self._autosave_settings()
             pixmap = QPixmap(file_path)
             
             # 缩放图片以适应显示区域
@@ -397,9 +417,63 @@ class QRCodeDecoder(QMainWindow):
             return
         
         try:
+            # 图像预处理函数
+            def preprocess_image(img):
+                """图像预处理以提高识别率"""
+                # 转换为灰度图
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                
+                # 自适应直方图均衡化
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                enhanced = clahe.apply(gray)
+                
+                # 高斯模糊降噪
+                blurred = cv2.GaussianBlur(enhanced, (3,3), 0)
+                
+                # 二值化
+                _, binary = cv2.threshold(blurred, 0, 255, 
+                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                # 形态学操作（可选）
+                kernel = np.ones((3,3), np.uint8)
+                processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+                
+                return processed
+            
+            # 支持的条码类型映射表
+            type_mapping = {
+                'AZTEC': 'Aztec码',
+                'CODABAR': 'Codabar条形码',
+                'CODE128': 'Code 128条形码',
+                'CODE39': 'Code 39条形码',
+                'CODE93': 'Code 93条形码',
+                'DATA MATRIX': 'Data Matrix码',
+                'EAN13': 'EAN-13条形码',
+                'EAN8': 'EAN-8条形码',
+                'ITF': 'ITF条形码(Interleaved 2 of 5)',
+                'MAXICODE': 'MaxiCode码',
+                'PDF417': 'PDF417码',
+                'QRCODE': '二维码',
+                'RSS14': 'RSS-14复合条形码',
+                'RSS_EXPANDED': '扩展RSS条形码',
+                'UPC_A': 'UPC-A条形码',
+                'UPC_E': 'UPC-E条形码',
+                'MICRO_QR': '微型二维码',
+                'I25': '工业2 of 5条形码',
+                'MSI': 'MSI条形码',
+                'PLESSEY': 'Plessey条形码',
+                'DATABAR': 'GS1 DataBar条形码',
+                'DATABAR_EXP': 'GS1 DataBar扩展条形码',
+                'JAPAN_POST': '日本邮政条形码',
+                'KIX': '荷兰KIX邮政码',
+                'CODE11': 'Code 11条形码',
+                'PHARMA': '制药条形码',
+                'TELEPEN': 'Telepen条形码'
+            }
+            
+            print(f"[DEBUG] 开始解码，图片路径: {getattr(self, 'current_image_path', 'N/A')}")
             # 处理剪贴板图片
             if self.current_image_path == "clipboard":
-                # 检查剪贴板图片是否有效
                 if not hasattr(self, 'image_label') or not self.image_label.pixmap():
                     raise ValueError("剪贴板中没有有效的图片")
                 
@@ -440,7 +514,6 @@ class QRCodeDecoder(QMainWindow):
                     if bytes_per_line == width * 3:  # 无填充
                         img = arr.reshape((height, width, 3))
                     else:  # 有行填充
-                        # 计算实际每行像素数据大小
                         img = arr.reshape((height, bytes_per_line))
                         img = img[:, :width*3]  # 去除填充部分
                         img = img.reshape((height, width, 3))
@@ -461,31 +534,23 @@ class QRCodeDecoder(QMainWindow):
                 raise ValueError("无效的图片数据")
             
             # 解码二维码和条形码
-            decoded_objects = decode(img)
+            # 原始图像用于显示
+            marked_img = img.copy()
+            
+            # 预处理后的图像用于解码
+            processed_img = preprocess_image(img)
+            decoded_objects = decode(processed_img)  # 先尝试预处理后的图像
             
             if not decoded_objects:
-                QMessageBox.information(self, "提示", "未检测到二维码或条形码")
-                return
+                # 如果预处理后识别失败，尝试原始图像
+                decoded_objects = decode(img)
+                if not decoded_objects:
+                    QMessageBox.information(self, "提示", "未检测到二维码或条形码")
+                    return
             
             # 创建带标记的图片副本用于显示
             marked_img = img.copy()
 
-            # 支持的类型映射表
-            type_mapping = {
-                'AZTEC': 'Aztec码',
-                'CODE128': 'Code 128条形码',
-                'CODE39': 'Code 39条形码',
-                'CODE93': 'Code 93条形码',
-                'DATA MATRIX': 'Data Matrix码',
-                'EAN13': 'EAN-13条形码',
-                'EAN8': 'EAN-8条形码',
-                'ITF': 'ITF条形码',
-                'PDF417': 'PDF417码',
-                'QRCODE': '二维码',
-                'UPC-A': 'UPC-A条形码',
-                'UPC-E': 'UPC-E条形码'
-            }
-            
             # 拼接所有解码结果，包含类型信息
             results = []
             print(f"[DEBUG] 解码结果数量: {len(decoded_objects)}")
@@ -502,7 +567,8 @@ class QRCodeDecoder(QMainWindow):
                 # 在图片上标记二维码位置
                 points = obj.polygon
                 if len(points) > 4: 
-                    hull = cv2.convexHull(np.array([point for point in points], dtype=np.float32))
+                    # 确保点集格式正确
+                    hull = cv2.convexHull(np.array([(point.x, point.y) for point in points], dtype=np.int32))
                     cv2.polylines(marked_img, [hull], True, (0, 255, 0), 2)
                 else:
                     # 绘制边界框
@@ -546,6 +612,7 @@ class QRCodeDecoder(QMainWindow):
             QMessageBox.critical(self, "错误", error_msg)
             self.status_bar.showMessage(error_msg, 3000)
 
+
     
     def copy_result(self):
         """复制解码结果"""
@@ -575,11 +642,37 @@ class QRCodeDecoder(QMainWindow):
         if content.startswith("["):
             code_type = content.split("]")[0][1:]
         
+        # 保存压缩后的截图
+        screenshot_path = ""
+        if hasattr(self, 'current_image_path') and self.current_image_path:
+            try:
+                # Create screenshots directory if not exists
+                screenshots_dir = os.path.join(os.path.dirname(__file__), 'screenshots')
+                os.makedirs(screenshots_dir, exist_ok=True)
+                
+                # Generate unique filename
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                screenshot_path = os.path.join(screenshots_dir, f'screenshot_{timestamp}.jpg')
+                
+                # Get current pixmap and save as compressed JPEG
+                pixmap = self.image_label.pixmap()
+                if pixmap and not pixmap.isNull():
+                    # 直接保存到文件而不使用BytesIO中转
+                    success = pixmap.save(screenshot_path, "JPEG", quality=85)
+                    if not success:
+                        print("Failed to save screenshot: save operation returned False")
+                        screenshot_path = ""
+                        
+            except Exception as e:
+                print(f"Failed to save screenshot: {str(e)}")
+                screenshot_path = ""
+
         self.cursor.execute(
             "INSERT INTO history (content, image_path, code_type) VALUES (?, ?, ?)",
-            (content, image_path, code_type)
+            (content, screenshot_path, code_type)
         )
         self.conn.commit()
+
 
     
     def load_history(self):
@@ -630,8 +723,8 @@ class QRCodeDecoder(QMainWindow):
         self.copy_button.setEnabled(True)
         self.update_background_colors()  # 添加这行
         
-        # 显示图片
-        if image_path:
+        # 显示图片和截图
+        if image_path and os.path.exists(image_path):
             try:
                 self.current_image_path = image_path
                 pixmap = QPixmap(image_path)
@@ -645,9 +738,14 @@ class QRCodeDecoder(QMainWindow):
                 
                 self.image_label.setPixmap(scaled_pixmap)
                 self.decode_button.setEnabled(True)
-                self.status_bar.showMessage(f"已加载历史记录: {timestamp}", 3000)
-            except:
-                self.status_bar.showMessage("无法加载历史图片", 3000)
+                self.status_bar.showMessage(f"已加载历史记录和截图: {timestamp}", 3000)
+            except Exception as e:
+                print(f"加载截图失败: {str(e)}")
+                self.status_bar.showMessage("无法加载历史截图", 3000)
+        else:
+            self.image_label.clear()
+            self.status_bar.showMessage(f"已加载历史记录: {timestamp} (无截图)", 3000)
+
 
 
 
@@ -722,7 +820,7 @@ class QRCodeDecoder(QMainWindow):
     def export_history(self, format='csv'):
         """导出历史记录"""
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "导出历史记录", "", 
+            self, "导出历史记录", self._last_dir, 
             f"{format.upper()} 文件 (*.{format})"
         )
         
@@ -762,18 +860,32 @@ class QRCodeDecoder(QMainWindow):
         
         reply = QMessageBox.question(
             self, "确认删除",
-            f"确定要删除选中的 {len(selected_items)} 条历史记录吗？此操作不可撤销！",
+            f"确定要删除选中的 {len(selected_items)} 条历史记录及其截图吗？此操作不可撤销！",
             QMessageBox.Yes | QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
+            deleted_files = 0
             for item in selected_items:
                 record = item.data(Qt.UserRole)
+                # Delete associated screenshot file if exists
+                if len(record) >= 4 and record[3] and os.path.exists(record[3]):
+                    try:
+                        os.remove(record[3])
+                        deleted_files += 1
+                    except Exception as e:
+                        print(f"Failed to delete screenshot {record[3]}: {str(e)}")
+                
+                # Delete database record
                 self.cursor.execute("DELETE FROM history WHERE id=?", (record[0],))
                 self.history_list.takeItem(self.history_list.row(item))
             
             self.conn.commit()
-            self.status_bar.showMessage(f"已删除 {len(selected_items)} 条历史记录", 3000)
+            self.status_bar.showMessage(
+                f"已删除 {len(selected_items)} 条历史记录及 {deleted_files} 个截图文件", 
+                3000
+            )
+
             
     def toggle_favorite(self):
         """切换历史记录的收藏状态"""
@@ -812,15 +924,35 @@ class QRCodeDecoder(QMainWindow):
         """清空所有历史记录"""
         reply = QMessageBox.question(
             self, "确认清空",
-            "确定要清空所有历史记录吗？此操作不可撤销！",
+            "确定要清空所有历史记录吗？此操作会删除所有截图文件且不可撤销！",
             QMessageBox.Yes | QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
+            # First get all image paths from database
+            self.cursor.execute("SELECT image_path FROM history")
+            image_paths = [record[0] for record in self.cursor.fetchall()]
+            
+            # Delete the database records
             self.cursor.execute("DELETE FROM history")
             self.conn.commit()
             self.history_list.clear()
-            self.status_bar.showMessage("已清空所有历史记录", 5000)
+            
+            # Delete associated screenshot files
+            deleted_files = 0
+            for path in image_paths:
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        deleted_files += 1
+                    except Exception as e:
+                        print(f"Failed to delete screenshot {path}: {str(e)}")
+            
+            self.status_bar.showMessage(
+                f"已清空所有历史记录，删除 {deleted_files} 个截图文件", 
+                5000
+            )
+
 
     def update_background_colors(self):
         """更新左右两侧背景色（确保两侧颜色不同）"""
@@ -849,8 +981,50 @@ class QRCodeDecoder(QMainWindow):
         )
 
 
+    def load_settings(self):
+        """加载设置（QSettings 注册表：窗口几何/最大化/分割器/最后目录）"""
+        settings = QSettings("QRCodeDecoder", "QRCodeDecoder")
+        
+        # 窗口几何
+        geometry = settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        
+        # 是否最大化
+        self._start_maximized = settings.value("window_maximized", False, type=bool)
+        
+        # 分割器位置
+        splitter_state = settings.value("splitter_state")
+        if splitter_state and hasattr(self, 'splitter'):
+            self.splitter.restoreState(splitter_state)
+        
+        # 最后打开的目录
+        self._last_dir = settings.value("last_dir", "") or ""
+    
+    def save_settings(self):
+        """立即保存设置到注册表"""
+        settings = QSettings("QRCodeDecoder", "QRCodeDecoder")
+        settings.setValue("window_geometry", self.saveGeometry())
+        settings.setValue("window_maximized", self.isMaximized())
+        if hasattr(self, 'splitter'):
+            settings.setValue("splitter_state", self.splitter.saveState())
+        settings.setValue("last_dir", self._last_dir)
+        settings.sync()
+    
+    def _autosave_settings(self):
+        """防抖自动保存设置（500ms 内多次变更只保存一次）"""
+        if getattr(self, '_loading', False):
+            return
+        self._settings_save_timer.start()
+    
+    def _save_settings_now(self):
+        """定时器触发的立即保存"""
+        self.save_settings()
+
     def closeEvent(self, event):
-        """关闭窗口事件"""
+        """关闭窗口事件：先停止定时器并强制保存设置，再关闭数据库"""
+        self._settings_save_timer.stop()
+        self.save_settings()
         self.conn.close()
         event.accept()
 
@@ -863,5 +1037,8 @@ if __name__ == "__main__":
     app.setStyle('Fusion')  # 使用Fusion样式以获得更好的跨平台体验
     
     decoder = QRCodeDecoder()
-    decoder.show()
+    if decoder._start_maximized:
+        decoder.showMaximized()
+    else:
+        decoder.show()
     sys.exit(app.exec_())
